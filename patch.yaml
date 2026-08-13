@@ -1,0 +1,119 @@
+# patch.yaml — representative launch changes for public-api
+# Applied on top of the existing Deployment/HPA/PDB. Resource
+# requests/limits are intentionally left unchanged (see answer.md).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: public-api
+spec:
+  # replicas is controlled by the HPA at event time; this is a safe
+  # non-event baseline only.
+  replicas: 48
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # 10% surge per the launch requirement (was 25%).
+      maxSurge: 10%
+      # Do not shed capacity during a peak-time rollout; the surge
+      # nodes/pods (Task 1 item 4) are pre-provisioned to cover this.
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: public-api
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          # Hard requirement: the AZ-loss math (83 pods/AZ, any 2 AZs
+          # cover 165) depends on genuinely even placement, not
+          # best-effort placement.
+          whenUnsatisfiable: DoNotSchedule
+          minDomains: 3
+          labelSelector:
+            matchLabels:
+              app: public-api
+      containers:
+        - name: api
+          image: private-ecr.example/public-api:stable
+          # Readiness now gates on the app's own warm-up signal, not
+          # basic health, so unwarmed pods (capped at 300 RPS) do not
+          # take a full share of traffic during the ramp.
+          readinessProbe:
+            httpGet: {path: /ready-warm, port: 8080}
+            initialDelaySeconds: 8      # matches measured Ready-at time
+            periodSeconds: 5
+            failureThreshold: 3
+          # Liveness stays on basic health and is decoupled from
+          # warm-up so a slow-warming (but alive) pod is never killed.
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          # startupProbe protects liveness during the ~60s warm window
+          # so periodSeconds/failureThreshold above can stay tight.
+          startupProbe:
+            httpGet: {path: /health, port: 8080}
+            failureThreshold: 12
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}   # unchanged, see answer.md
+            limits: {cpu: "1", memory: 1Gi}          # unchanged, see answer.md
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: public-api
+spec:
+  # Floor set to the AZ-loss-safe steady-peak requirement (83/AZ x 3).
+  # Raised here ahead of the event by the pre-launch scheduled action
+  # described in answer.md — this is the ceiling for normal operation,
+  # not the mechanism that reacts during the 2-minute ramp.
+  minReplicas: 249
+  # Ceiling covers the 10% deployment-surge case (~276 pods) plus
+  # margin, without exceeding node/vCPU/cost budgets calculated in
+  # answer.md.
+  maxReplicas: 280
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: public-api
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 40
+          periodSeconds: 60
+    scaleDown:
+      # Slow scale-down so capacity isn't pulled mid-peak on a
+      # transient utilization dip.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 10
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: public-api
+spec:
+  # Tightened from 70%: at 249 pods, 70% would allow ~75 pods of
+  # concurrent voluntary disruption, which can stack with an
+  # unplanned AZ loss and threaten the 165-pod post-loss floor.
+  # 90% keeps voluntary disruption small enough that it does not
+  # erode the AZ-loss safety margin.
+  minAvailable: 90%
+  selector:
+    matchLabels:
+      app: public-api
