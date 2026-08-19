@@ -1,0 +1,49 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 249  # Forces a perfect 83-83-83 pod floor across 3 AZs BEFORE the launch starts
+  maxReplicas: 276  # Establishes an absolute ceiling for a 10% rolling deployment surge (92 pods per AZ)
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+spec:
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: "topology.kubernetes.io/zone"
+          whenUnsatisfiable: DoNotSchedule  # Hard mandate enforcing perfect Multi-AZ structural balance
+          labelSelector:
+            matchLabels:
+              app: api-service
+      containers:
+        - name: api-container
+          resources:
+            requests:
+              cpu: "480m"     # Exact benchmark sweet spot required to sustain 600 RPS cleanly
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"    # Burst ceiling allowing rapid startup and high concurrency compilation
+              memory: "1024Mi" # RAM guardrail providing a safety buffer to defeat OOMKill events
+          readinessProbe:
+            httpGet:
+              path: /ready-warm  # Custom route that isolates traffic from pods during the 60s cold-start phase
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 12  # 12 * 5 seconds = 60 seconds total warming insulation
